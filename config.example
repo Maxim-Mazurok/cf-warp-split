@@ -1,0 +1,47 @@
+# Internal domains that must resolve through WARP's DNS proxy.
+#
+# List your organization's private domains here — one per line.
+# Subdomains are matched automatically (e.g. "example.corp" covers
+# "anything.example.corp" as well).
+#
+# Lines starting with # are comments. Blank lines are ignored.
+
+INTERNAL_DOMAINS=(
+    "internal.example.com"
+    "vpn.example.com"
+    "example.corp"
+    "yourorg.cloudflareaccess.com"
+)
+
+# Public DNS servers used for everything NOT in INTERNAL_DOMAINS.
+# These receive your external queries directly, bypassing Cloudflare Gateway.
+PUBLIC_DNS_SERVERS=(
+    "1.1.1.1"
+    "1.0.0.1"
+    "8.8.8.8"
+    "8.8.4.4"
+)
+
+# Standard private/internal TLDs that should always go through WARP.
+# You probably don't need to change these — they cover RFC-standard
+# private-use TLDs and common enterprise conventions.
+FALLBACK_TLDS=(
+    "home.arpa"
+    "corp"
+    "domain"
+    "home"
+    "host"
+    "internal"
+    "intranet"
+    "invalid"
+    "lan"
+    "local"
+    "localdomain"
+    "localhost"
+    "private"
+    "test"
+)
+
+# Enable dnsmasq query logging. Useful for debugging, but writes every
+# DNS query to disk. Set to false once you've verified things work.
+ENABLE_LOGGING=true

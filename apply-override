@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+#
+# apply-override — daemon that maintains the SupplementalMatchDomains DNS override
+#
+# Runs as a LaunchDaemon. Applies a macOS dynamic-store entry that tells
+# mDNSResponder to prefer our local dnsmasq over WARP's DNS proxy.
+# Polls every 5 seconds and re-applies if the entry was cleared
+# (e.g. after sleep/wake, WARP reconnect, network change).
+
+set -euo pipefail
+
+SCUTIL=/usr/sbin/scutil
+DNSMASQ_ADDRESS="127.0.0.1"
+SERVICE_KEY="State:/Network/Service/CustomSplitDNS/DNS"
+
+apply_override() {
+    $SCUTIL <<EOF
+d.init
+d.add ServerAddresses * $DNSMASQ_ADDRESS
+d.add SupplementalMatchDomains * ""
+d.add SupplementalMatchOrders * 1
+set $SERVICE_KEY
+EOF
+}
+
+check_override() {
+    $SCUTIL <<EOF | grep -q "$DNSMASQ_ADDRESS"
+show $SERVICE_KEY
+EOF
+}
+
+# Apply immediately on start
+apply_override
+logger -t warp-split "Applied DNS override on start"
+
+# Poll — re-apply if removed
+while true; do
+    sleep 5
+
+    if ! check_override; then
+        apply_override
+        logger -t warp-split "Re-applied DNS override after change detected"
+    fi
+done

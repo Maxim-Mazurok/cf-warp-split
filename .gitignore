@@ -1,0 +1,13 @@
+# User config — not tracked in git
+config
+
+# dnsmasq query log (if symlinked or copied here)
+*.log
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
