@@ -71,6 +71,13 @@ load_config() {
     source "$CONFIG_FILE"
 }
 
+load_config_if_present() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Generators
 # ---------------------------------------------------------------------------
@@ -96,11 +103,12 @@ no-poll
 # Local DNS cache
 cache-size=1000
 
-# === Internal domains → WARP DNS proxy (${WARP_DNS_PROXY}) ===
+# === Internal domains → WARP DNS proxies (${WARP_DNS_PROXY}, ${WARP_DNS_PROXY_ALT}) ===
 DNSMASQ_EOF
 
     for domain in "${INTERNAL_DOMAINS[@]}"; do
         echo "server=/${domain}/${WARP_DNS_PROXY}" >> "$output_file"
+        echo "server=/${domain}/${WARP_DNS_PROXY_ALT}" >> "$output_file"
     done
 
     echo "" >> "$output_file"
@@ -108,11 +116,17 @@ DNSMASQ_EOF
 
     for tld in "${FALLBACK_TLDS[@]}"; do
         echo "server=/${tld}/${WARP_DNS_PROXY}" >> "$output_file"
+        echo "server=/${tld}/${WARP_DNS_PROXY_ALT}" >> "$output_file"
     done
 
     echo "" >> "$output_file"
     echo "# WARP internal connectivity check" >> "$output_file"
     echo "server=/warp-svc/${WARP_DNS_PROXY}" >> "$output_file"
+    echo "server=/warp-svc/${WARP_DNS_PROXY_ALT}" >> "$output_file"
+
+    echo "" >> "$output_file"
+    echo "# Do not keep transient private-DNS negative answers around" >> "$output_file"
+    echo "no-negcache" >> "$output_file"
 
     echo "" >> "$output_file"
     echo "# === External DNS (bypasses Cloudflare Gateway) ===" >> "$output_file"
@@ -288,6 +302,8 @@ command_disable() {
 }
 
 command_status() {
+    load_config_if_present
+
     echo ""
     bold "  Split DNS Status"
     echo ""
@@ -300,7 +316,7 @@ command_status() {
     fi
 
     # Override daemon
-    if sudo launchctl list "$DAEMON_LABEL" &>/dev/null 2>&1; then
+    if launchctl print "system/$DAEMON_LABEL" &>/dev/null 2>&1; then
         info "Override daemon: $(green "running")"
     else
         fail "Override daemon: $(red "stopped")"
@@ -311,6 +327,16 @@ command_status() {
         info "DNS override: $(green "active")"
     else
         fail "DNS override: $(red "inactive")"
+    fi
+
+    # WARP DNS health
+    local healthcheck_domain="${WARP_DNS_HEALTHCHECK_DOMAIN:-}"
+    if [[ -n "$healthcheck_domain" ]]; then
+        if /usr/bin/dig @"$WARP_DNS_PROXY" "$healthcheck_domain" A +short +time=2 +tries=1 2>/dev/null | grep -Eq '(^|[[:space:]])([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+            info "WARP DNS health: $(green "ok") ($healthcheck_domain via $WARP_DNS_PROXY)"
+        else
+            fail "WARP DNS health: $(red "failing") ($healthcheck_domain via $WARP_DNS_PROXY)"
+        fi
     fi
 
     # /etc/hosts

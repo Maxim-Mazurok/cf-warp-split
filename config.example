@@ -42,6 +42,14 @@ FALLBACK_TLDS=(
     "test"
 )
 
+# Optional hostname that must resolve through WARP DNS. When set, the
+# LaunchDaemon checks WARP's DNS proxy periodically and restarts WARP after
+# repeated failures.
+WARP_DNS_HEALTHCHECK_DOMAIN=""
+WARP_DNS_HEALTHCHECK_INTERVAL_SECONDS=30
+WARP_DNS_HEALTHCHECK_FAILURE_THRESHOLD=3
+WARP_DNS_HEALTHCHECK_RECOVERY_COOLDOWN_SECONDS=$((5 * 60))
+
 # Enable dnsmasq query logging. Useful for debugging, but writes every
 # DNS query to disk. Set to false once you've verified things work.
 ENABLE_LOGGING=true

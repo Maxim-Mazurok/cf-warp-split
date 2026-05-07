@@ -27,7 +27,7 @@ The solution has three moving parts:
 ### 1. dnsmasq (DNS forwarder)
 
 Installed via Homebrew. Listens on `127.0.0.1:53` and conditionally forwards:
-- Configured internal domains → `127.0.2.2` (WARP's DNS proxy)
+- Configured internal domains → `127.0.2.2` and `127.0.2.3` (WARP's DNS proxies)
 - Everything else → public DNS servers
 
 ### 2. SupplementalMatchDomains override
@@ -35,6 +35,8 @@ Installed via Homebrew. Listens on `127.0.0.1:53` and conditionally forwards:
 A `State:/Network/Service/CustomSplitDNS/DNS` entry in the macOS dynamic store (`scutil`). This tells `mDNSResponder` to prefer our dnsmasq at order 103800 over WARP's resolver at 200000.
 
 WARP watches and re-applies `Setup:` keys but ignores custom `State:` supplemental services — this is the key insight that makes the whole approach work.
+
+The same daemon can also run an optional WARP DNS health check. When `WARP_DNS_HEALTHCHECK_DOMAIN` is configured, it queries `127.0.2.2` directly and restarts the WARP daemon after repeated failures. This catches cases where macOS and dnsmasq are healthy but WARP's local DNS proxy starts returning errors for private records.
 
 ### 3. /etc/hosts entry
 
@@ -66,6 +68,9 @@ Since this modifies system-level DNS, testing requires care:
 
    # Check WARP is still connected
    warp-cli status
+
+   # If configured, verify WARP DNS health appears in status
+   ./warp-split status
 
    # Tail the query log to see routing decisions
    ./warp-split logs

@@ -9,9 +9,27 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config"
+
 SCUTIL=/usr/sbin/scutil
 DNSMASQ_ADDRESS="127.0.0.1"
+WARP_DNS_PROXY="127.0.2.2"
 SERVICE_KEY="State:/Network/Service/CustomSplitDNS/DNS"
+WARP_DAEMON_LABEL="com.cloudflare.1dot1dot1dot1.macos.warp.daemon"
+OVERRIDE_POLL_INTERVAL_SECONDS=5
+
+load_config_if_available() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    : "${WARP_DNS_HEALTHCHECK_DOMAIN:=}"
+    : "${WARP_DNS_HEALTHCHECK_INTERVAL_SECONDS:=30}"
+    : "${WARP_DNS_HEALTHCHECK_FAILURE_THRESHOLD:=3}"
+    : "${WARP_DNS_HEALTHCHECK_RECOVERY_COOLDOWN_SECONDS:=$((5 * 60))}"
+}
 
 apply_override() {
     $SCUTIL <<EOF
@@ -29,16 +47,76 @@ show $SERVICE_KEY
 EOF
 }
 
+query_warp_dns_proxy() {
+    /usr/bin/dig @"$WARP_DNS_PROXY" "$WARP_DNS_HEALTHCHECK_DOMAIN" A +short +time=2 +tries=1 2>/dev/null \
+        | /usr/bin/grep -Eq '(^|[[:space:]])([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+recover_warp_dns_proxy() {
+    logger -t warp-split "Restarting WARP daemon after repeated DNS health check failures for $WARP_DNS_HEALTHCHECK_DOMAIN"
+
+    if /bin/launchctl kickstart -k "system/$WARP_DAEMON_LABEL"; then
+        logger -t warp-split "Restarted WARP daemon after DNS health check failures"
+    else
+        logger -t warp-split "Failed to restart WARP daemon after DNS health check failures"
+    fi
+
+    /usr/bin/dscacheutil -flushcache 2>/dev/null || true
+    apply_override
+}
+
+run_warp_dns_healthcheck() {
+    local current_time="$1"
+
+    if [[ -z "$WARP_DNS_HEALTHCHECK_DOMAIN" ]]; then
+        return
+    fi
+
+    if (( current_time - last_healthcheck_time < WARP_DNS_HEALTHCHECK_INTERVAL_SECONDS )); then
+        return
+    fi
+
+    last_healthcheck_time="$current_time"
+
+    if query_warp_dns_proxy; then
+        healthcheck_failure_count=0
+        return
+    fi
+
+    healthcheck_failure_count=$((healthcheck_failure_count + 1))
+    logger -t warp-split "WARP DNS health check failed for $WARP_DNS_HEALTHCHECK_DOMAIN ($healthcheck_failure_count/$WARP_DNS_HEALTHCHECK_FAILURE_THRESHOLD)"
+
+    if (( healthcheck_failure_count < WARP_DNS_HEALTHCHECK_FAILURE_THRESHOLD )); then
+        return
+    fi
+
+    if (( current_time - last_recovery_time < WARP_DNS_HEALTHCHECK_RECOVERY_COOLDOWN_SECONDS )); then
+        return
+    fi
+
+    last_recovery_time="$current_time"
+    healthcheck_failure_count=0
+    recover_warp_dns_proxy
+}
+
+load_config_if_available
+
+healthcheck_failure_count=0
+last_healthcheck_time=0
+last_recovery_time=0
+
 # Apply immediately on start
 apply_override
 logger -t warp-split "Applied DNS override on start"
 
 # Poll — re-apply if removed
 while true; do
-    sleep 5
+    sleep "$OVERRIDE_POLL_INTERVAL_SECONDS"
 
     if ! check_override; then
         apply_override
         logger -t warp-split "Re-applied DNS override after change detected"
     fi
+
+    run_warp_dns_healthcheck "$(date +%s)"
 done

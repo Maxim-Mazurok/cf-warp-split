@@ -40,7 +40,7 @@ Cloudflare
 1. **dnsmasq** listens on `127.0.0.1:53`. WARP's proxy lives on `127.0.2.2:53` — no port conflict.
 2. A **SupplementalMatchDomains** entry in the macOS dynamic store tells `mDNSResponder` to send all queries to dnsmasq first (order 103800), before WARP's resolver (order 200000).
 3. dnsmasq **forwards** queries for your internal domains to WARP's DNS proxy, and everything else to public DNS.
-4. A small **LaunchDaemon** re-applies the override every 5 seconds in case macOS clears it (sleep/wake, network changes, WARP reconnects).
+4. A small **LaunchDaemon** re-applies the override every 5 seconds in case macOS clears it (sleep/wake, network changes, WARP reconnects). If configured, it also checks WARP's DNS proxy and restarts WARP after repeated proxy failures.
 5. An `/etc/hosts` entry for `connectivity-check.warp-svc` keeps WARP's internal health check working — it uses `getaddrinfo()` which can't resolve this synthetic hostname through DNS, only through `/etc/hosts`.
 
 ### Why WARP doesn't fight it
@@ -122,6 +122,19 @@ The config includes standard private-use TLDs (`.corp`, `.internal`, `.lan`, etc
 
 Set `ENABLE_LOGGING=true` in your config to log all DNS queries to `$HOMEBREW_PREFIX/var/log/dnsmasq.log`. Useful for debugging. Disable once verified.
 
+### WARP DNS health check
+
+Set `WARP_DNS_HEALTHCHECK_DOMAIN` to a hostname that must resolve through WARP DNS:
+
+```bash
+WARP_DNS_HEALTHCHECK_DOMAIN="known.internal.example.com"
+WARP_DNS_HEALTHCHECK_INTERVAL_SECONDS=30
+WARP_DNS_HEALTHCHECK_FAILURE_THRESHOLD=3
+WARP_DNS_HEALTHCHECK_RECOVERY_COOLDOWN_SECONDS=$((5 * 60))
+```
+
+The override daemon queries WARP's local DNS proxy directly. After repeated failures it restarts the WARP daemon, flushes the macOS DNS cache, and reapplies the resolver override.
+
 ## Updating internal domains
 
 1. Edit your `config` file
@@ -160,6 +173,15 @@ Make sure the domain is in your `config` file and regenerate:
 ```bash
 sudo ./warp-split generate
 ```
+
+If the domain is configured but still fails, compare dnsmasq and WARP directly:
+
+```bash
+dig your.internal.domain @127.0.0.1
+dig your.internal.domain @127.0.2.2
+```
+
+If dnsmasq logs `reply error is SERVFAIL` for the A query, the request reached the split resolver and WARP's DNS proxy returned an error. Configure `WARP_DNS_HEALTHCHECK_DOMAIN` so the daemon can detect repeated failures and restart WARP automatically.
 
 ### Verifying the split
 
