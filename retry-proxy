@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""
+retry-proxy — UDP DNS proxy that retries WARP's DNS proxy on SERVFAIL.
+
+WARP's local DNS proxies (127.0.2.2 / 127.0.2.3) intermittently return
+SERVFAIL for queries that resolve fine on retry. macOS mDNSResponder caches
+the SERVFAIL as a hard negative for several seconds, so subsequent
+getaddrinfo() calls (ping, curl, browsers) fail with "Unknown host" until
+the cache expires.
+
+This proxy sits between dnsmasq and WARP's DNS proxies. For every incoming
+query it forwards to the WARP proxies and, on SERVFAIL, retries the
+alternate proxy (and again the first) up to MAX_ATTEMPTS times. Any
+non-SERVFAIL response is returned immediately.
+
+Listens on UDP only — TCP is not used by dnsmasq's forwarder for these
+queries.
+"""
+
+from __future__ import annotations
+
+import logging
+import logging.handlers
+import socket
+import socketserver
+import struct
+import sys
+import time
+
+LISTEN_HOST = "127.0.0.1"
+LISTEN_PORT = 5354
+
+UPSTREAMS: tuple[tuple[str, int], ...] = (
+    ("127.0.2.2", 53),
+    ("127.0.2.3", 53),
+)
+
+MAX_ATTEMPTS = 4
+UPSTREAM_TIMEOUT_SECONDS = 0.7
+RETRY_BACKOFF_SECONDS = 0.025
+
+DNS_RCODE_SERVFAIL = 2
+
+logger = logging.getLogger("warp-split-retry-proxy")
+
+
+def extract_rcode(packet: bytes) -> int:
+    if len(packet) < 4:
+        return -1
+    flags = struct.unpack("!H", packet[2:4])[0]
+    return flags & 0x0F
+
+
+def extract_question(packet: bytes) -> str:
+    """Return a short 'NAME TYPE' string for logging. Best-effort."""
+    if len(packet) < 13:
+        return "?"
+    offset = 12
+    labels: list[str] = []
+    while offset < len(packet):
+        length = packet[offset]
+        if length == 0:
+            offset += 1
+            break
+        if length & 0xC0:
+            return "?"
+        offset += 1
+        labels.append(packet[offset : offset + length].decode("ascii", "replace"))
+        offset += length
+    if offset + 2 > len(packet):
+        return ".".join(labels)
+    qtype = struct.unpack("!H", packet[offset : offset + 2])[0]
+    type_names = {1: "A", 2: "NS", 5: "CNAME", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 65: "HTTPS"}
+    return f"{'.'.join(labels)} {type_names.get(qtype, str(qtype))}"
+
+
+def forward_once(upstream: tuple[str, int], packet: bytes, timeout: float) -> bytes:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_socket:
+        upstream_socket.settimeout(timeout)
+        upstream_socket.sendto(packet, upstream)
+        response, _ = upstream_socket.recvfrom(65535)
+        return response
+
+
+def resolve(packet: bytes) -> bytes | None:
+    last_response: bytes | None = None
+    for attempt_index in range(MAX_ATTEMPTS):
+        upstream = UPSTREAMS[attempt_index % len(UPSTREAMS)]
+        try:
+            response = forward_once(upstream, packet, UPSTREAM_TIMEOUT_SECONDS)
+        except (socket.timeout, OSError) as error:
+            logger.warning(
+                "upstream %s:%d error on attempt %d for %s: %s",
+                upstream[0], upstream[1], attempt_index + 1, extract_question(packet), error,
+            )
+            continue
+
+        last_response = response
+        if extract_rcode(response) != DNS_RCODE_SERVFAIL:
+            if attempt_index > 0:
+                logger.info(
+                    "recovered after %d attempts for %s via %s:%d",
+                    attempt_index + 1, extract_question(packet), upstream[0], upstream[1],
+                )
+            return response
+
+        logger.warning(
+            "SERVFAIL on attempt %d for %s via %s:%d",
+            attempt_index + 1, extract_question(packet), upstream[0], upstream[1],
+        )
+        time.sleep(RETRY_BACKOFF_SECONDS)
+
+    logger.error(
+        "exhausted %d attempts for %s — returning last response",
+        MAX_ATTEMPTS, extract_question(packet),
+    )
+    return last_response
+
+
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        packet, server_socket = self.request
+        try:
+            response = resolve(packet)
+        except Exception as error:
+            logger.exception("unhandled error resolving query: %s", error)
+            return
+        if response is not None:
+            try:
+                server_socket.sendto(response, self.client_address)
+            except OSError as error:
+                logger.warning("failed to send response to %s: %s", self.client_address, error)
+
+
+class ThreadedUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def configure_logging() -> None:
+    logger.setLevel(logging.INFO)
+    handler = logging.handlers.SysLogHandler(address="/var/run/syslog")
+    handler.ident = "warp-split-retry-proxy "
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(stream_handler)
+
+
+def main() -> None:
+    configure_logging()
+    server = ThreadedUDPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    logger.info("listening on %s:%d, upstreams=%s", LISTEN_HOST, LISTEN_PORT, list(UPSTREAMS))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

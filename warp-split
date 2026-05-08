@@ -18,15 +18,20 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config"
 CONFIG_EXAMPLE="$SCRIPT_DIR/config.example"
 DAEMON_SCRIPT="$SCRIPT_DIR/apply-override"
+RETRY_PROXY_SCRIPT="$SCRIPT_DIR/retry-proxy"
 
 DAEMON_LABEL="com.local.split-dns"
 DAEMON_PLIST="/Library/LaunchDaemons/$DAEMON_LABEL.plist"
+RETRY_PROXY_LABEL="com.local.split-dns-retry-proxy"
+RETRY_PROXY_PLIST="/Library/LaunchDaemons/$RETRY_PROXY_LABEL.plist"
 SCUTIL_SERVICE_KEY="State:/Network/Service/CustomSplitDNS/DNS"
 HOSTS_MARKER="# warp-split"
 
 WARP_DNS_PROXY="127.0.2.2"
 WARP_DNS_PROXY_ALT="127.0.2.3"
 DNSMASQ_LISTEN="127.0.0.1"
+RETRY_PROXY_LISTEN="127.0.0.1"
+RETRY_PROXY_PORT="5354"
 
 # Detect Homebrew prefix (Apple Silicon vs Intel)
 if [[ -d /opt/homebrew ]]; then
@@ -103,24 +108,25 @@ no-poll
 # Local DNS cache
 cache-size=1000
 
-# === Internal domains → WARP DNS proxies (${WARP_DNS_PROXY}, ${WARP_DNS_PROXY_ALT}) ===
+# === Internal domains → SERVFAIL-retry proxy → WARP DNS proxies ===
+# Retry proxy (${RETRY_PROXY_LISTEN}:${RETRY_PROXY_PORT}) forwards to
+# ${WARP_DNS_PROXY} / ${WARP_DNS_PROXY_ALT} and retries on SERVFAIL,
+# which WARP's DNS proxies return intermittently.
 DNSMASQ_EOF
 
     for domain in "${INTERNAL_DOMAINS[@]}"; do
-        echo "server=/${domain}/${WARP_DNS_PROXY}" >> "$output_file"
-        echo "server=/${domain}/${WARP_DNS_PROXY_ALT}" >> "$output_file"
+        echo "server=/${domain}/${RETRY_PROXY_LISTEN}#${RETRY_PROXY_PORT}" >> "$output_file"
     done
 
     echo "" >> "$output_file"
-    echo "# Standard private TLDs → WARP DNS proxy" >> "$output_file"
+    echo "# Standard private TLDs → SERVFAIL-retry proxy → WARP DNS proxy" >> "$output_file"
 
     for tld in "${FALLBACK_TLDS[@]}"; do
-        echo "server=/${tld}/${WARP_DNS_PROXY}" >> "$output_file"
-        echo "server=/${tld}/${WARP_DNS_PROXY_ALT}" >> "$output_file"
+        echo "server=/${tld}/${RETRY_PROXY_LISTEN}#${RETRY_PROXY_PORT}" >> "$output_file"
     done
 
     echo "" >> "$output_file"
-    echo "# WARP internal connectivity check" >> "$output_file"
+    echo "# WARP internal connectivity check (direct, not via retry proxy)" >> "$output_file"
     echo "server=/warp-svc/${WARP_DNS_PROXY}" >> "$output_file"
     echo "server=/warp-svc/${WARP_DNS_PROXY_ALT}" >> "$output_file"
 
@@ -171,6 +177,35 @@ generate_launchdaemon_plist() {
 PLIST_EOF
 
     info "Generated LaunchDaemon plist: $DAEMON_PLIST"
+}
+
+generate_retry_proxy_plist() {
+    cat > "$RETRY_PROXY_PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${RETRY_PROXY_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>${RETRY_PROXY_SCRIPT}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/warp-split-retry-proxy.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/warp-split-retry-proxy.stderr.log</string>
+</dict>
+</plist>
+PLIST_EOF
+
+    info "Generated retry-proxy LaunchDaemon plist: $RETRY_PROXY_PLIST"
 }
 
 # ---------------------------------------------------------------------------
@@ -228,6 +263,9 @@ command_setup() {
     step "Generating LaunchDaemon"
     generate_launchdaemon_plist
 
+    step "Generating retry-proxy LaunchDaemon"
+    generate_retry_proxy_plist
+
     step "Adding /etc/hosts entry"
     add_hosts_entry
 
@@ -253,12 +291,18 @@ command_teardown() {
     rm -f "$DAEMON_PLIST"
     info "Removed LaunchDaemon plist"
 
+    rm -f "$RETRY_PROXY_PLIST"
+    info "Removed retry-proxy LaunchDaemon plist"
+
     step "Done"
     info "Split DNS fully removed. WARP controls all DNS again."
     echo "  dnsmasq was left installed — run $(bold "brew uninstall dnsmasq") to remove it."
 }
 
 command_enable_quiet() {
+    launchctl load "$RETRY_PROXY_PLIST" 2>/dev/null || true
+    info "Retry-proxy daemon loaded"
+
     brew services start dnsmasq 2>/dev/null || true
     info "dnsmasq started"
 
@@ -290,6 +334,10 @@ SCUTIL_EOF
     brew services stop dnsmasq 2>/dev/null || true
     info "dnsmasq stopped"
 
+    # Stop retry proxy
+    launchctl unload "$RETRY_PROXY_PLIST" 2>/dev/null || true
+    info "Retry-proxy daemon unloaded"
+
     dscacheutil -flushcache 2>/dev/null || true
     info "DNS cache flushed"
 }
@@ -313,6 +361,13 @@ command_status() {
         info "dnsmasq: $(green "running") (pid $(pgrep -x dnsmasq))"
     else
         fail "dnsmasq: $(red "stopped")"
+    fi
+
+    # Retry proxy
+    if launchctl print "system/$RETRY_PROXY_LABEL" &>/dev/null 2>&1; then
+        info "Retry-proxy: $(green "running")"
+    else
+        fail "Retry-proxy: $(red "stopped")"
     fi
 
     # Override daemon
