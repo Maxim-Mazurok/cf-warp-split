@@ -108,6 +108,10 @@ no-poll
 # Local DNS cache
 cache-size=1000
 
+# Keep mDNSResponder's startup burst from making local clients time out.
+strict-order
+dns-forward-max=1000
+
 # === Internal domains → SERVFAIL-retry proxy → WARP DNS proxies ===
 # Retry proxy (${RETRY_PROXY_LISTEN}:${RETRY_PROXY_PORT}) forwards to
 # ${WARP_DNS_PROXY} / ${WARP_DNS_PROXY_ALT} and retries on SERVFAIL,
@@ -144,6 +148,7 @@ DNSMASQ_EOF
     if [[ "${ENABLE_LOGGING:-false}" == "true" ]]; then
         echo "" >> "$output_file"
         echo "# Query logging (disable in config to turn off)" >> "$output_file"
+        echo "log-async=100" >> "$output_file"
         echo "log-queries" >> "$output_file"
         echo "log-facility=${DNSMASQ_LOG_FILE}" >> "$output_file"
     fi
@@ -206,6 +211,22 @@ generate_retry_proxy_plist() {
 PLIST_EOF
 
     info "Generated retry-proxy LaunchDaemon plist: $RETRY_PROXY_PLIST"
+}
+
+wait_for_dnsmasq() {
+    local attempt
+
+    for attempt in {1..10}; do
+        if /usr/bin/dig @"$DNSMASQ_LISTEN" example.com A +short +time=1 +tries=1 2>/dev/null | grep -Eq '(^|[[:space:]])([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+            info "dnsmasq is answering DNS"
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    fail "dnsmasq did not answer a local DNS probe; refusing to apply DNS override"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -305,6 +326,8 @@ command_enable_quiet() {
 
     brew services start dnsmasq 2>/dev/null || true
     info "dnsmasq started"
+
+    wait_for_dnsmasq
 
     launchctl load "$DAEMON_PLIST" 2>/dev/null || true
     info "DNS override daemon loaded"
