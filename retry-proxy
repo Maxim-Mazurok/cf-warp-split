@@ -39,16 +39,73 @@ MAX_ATTEMPTS = 4
 UPSTREAM_TIMEOUT_SECONDS = 0.7
 RETRY_BACKOFF_SECONDS = 0.025
 
-DNS_RCODE_SERVFAIL = 2
+DNS_QUERY_TYPE_AAAA = 28
+DNS_RESPONSE_CODE_NOERROR = 0
+DNS_RESPONSE_CODE_SERVFAIL = 2
 
 logger = logging.getLogger("warp-split-retry-proxy")
 
 
-def extract_rcode(packet: bytes) -> int:
+def extract_response_code(packet: bytes) -> int:
     if len(packet) < 4:
         return -1
     flags = struct.unpack("!H", packet[2:4])[0]
     return flags & 0x0F
+
+
+def extract_question_end_offset(packet: bytes) -> int:
+    if len(packet) < 13:
+        return -1
+    offset = 12
+    while offset < len(packet):
+        length = packet[offset]
+        if length == 0:
+            offset += 1
+            break
+        if length & 0xC0:
+            return -1
+        offset += 1 + length
+    question_end_offset = offset + 4
+    if question_end_offset > len(packet):
+        return -1
+    return question_end_offset
+
+
+def extract_query_type(packet: bytes) -> int:
+    question_end_offset = extract_question_end_offset(packet)
+    if question_end_offset < 0:
+        return -1
+    offset = question_end_offset - 4
+    return struct.unpack("!H", packet[offset : offset + 2])[0]
+
+
+def build_empty_response(packet: bytes, response_code: int) -> bytes | None:
+    if len(packet) < 12:
+        return None
+    question_end_offset = extract_question_end_offset(packet)
+    if question_end_offset < 0:
+        return None
+    request_flags = struct.unpack("!H", packet[2:4])[0]
+    response_flags = 0x8000 | (request_flags & 0x0100) | 0x0080 | response_code
+    return b"".join(
+        (
+            packet[:2],
+            struct.pack("!H", response_flags),
+            packet[4:6],
+            b"\x00\x00",
+            b"\x00\x00",
+            b"\x00\x00",
+            packet[12:question_end_offset],
+        )
+    )
+
+
+def build_exhausted_attempts_response(packet: bytes, last_response: bytes | None) -> bytes | None:
+    if extract_query_type(packet) == DNS_QUERY_TYPE_AAAA:
+        return build_empty_response(packet, DNS_RESPONSE_CODE_NOERROR)
+    if last_response is not None:
+        return last_response
+    return build_empty_response(packet, DNS_RESPONSE_CODE_SERVFAIL)
 
 
 def extract_question(packet: bytes) -> str:
@@ -69,9 +126,9 @@ def extract_question(packet: bytes) -> str:
         offset += length
     if offset + 2 > len(packet):
         return ".".join(labels)
-    qtype = struct.unpack("!H", packet[offset : offset + 2])[0]
+    query_type = struct.unpack("!H", packet[offset : offset + 2])[0]
     type_names = {1: "A", 2: "NS", 5: "CNAME", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 65: "HTTPS"}
-    return f"{'.'.join(labels)} {type_names.get(qtype, str(qtype))}"
+    return f"{'.'.join(labels)} {type_names.get(query_type, str(query_type))}"
 
 
 def forward_once(upstream: tuple[str, int], packet: bytes, timeout: float) -> bytes:
@@ -96,7 +153,7 @@ def resolve(packet: bytes) -> bytes | None:
             continue
 
         last_response = response
-        if extract_rcode(response) != DNS_RCODE_SERVFAIL:
+        if extract_response_code(response) != DNS_RESPONSE_CODE_SERVFAIL:
             if attempt_index > 0:
                 logger.info(
                     "recovered after %d attempts for %s via %s:%d",
@@ -111,10 +168,10 @@ def resolve(packet: bytes) -> bytes | None:
         time.sleep(RETRY_BACKOFF_SECONDS)
 
     logger.error(
-        "exhausted %d attempts for %s — returning last response",
+        "exhausted %d attempts for %s; returning synthetic response when needed",
         MAX_ATTEMPTS, extract_question(packet),
     )
-    return last_response
+    return build_exhausted_attempts_response(packet, last_response)
 
 
 class Handler(socketserver.BaseRequestHandler):

@@ -36,7 +36,7 @@ A `State:/Network/Service/CustomSplitDNS/DNS` entry in the macOS dynamic store (
 
 WARP watches and re-applies `Setup:` keys but ignores custom `State:` supplemental services — this is the key insight that makes the whole approach work.
 
-The same daemon can also run an optional WARP DNS health check. When `WARP_DNS_HEALTHCHECK_DOMAIN` is configured, it queries `127.0.2.2` directly and restarts the WARP daemon after repeated failures. This catches cases where macOS and dnsmasq are healthy but WARP's local DNS proxy starts returning errors for private records.
+The same daemon can also run an optional WARP DNS health check. When `WARP_DNS_HEALTHCHECK_DOMAIN` is configured, it waits for dnsmasq and the split path to answer before applying the macOS resolver override. It also queries `127.0.2.2` directly and restarts the WARP daemon after repeated failures. This catches cases where macOS and dnsmasq are healthy but WARP's local DNS proxy starts returning errors for private records.
 
 ### 3. /etc/hosts entry
 

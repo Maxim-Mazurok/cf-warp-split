@@ -18,6 +18,7 @@ WARP_DNS_PROXY="127.0.2.2"
 SERVICE_KEY="State:/Network/Service/CustomSplitDNS/DNS"
 WARP_DAEMON_LABEL="com.cloudflare.1dot1dot1dot1.macos.warp.daemon"
 OVERRIDE_POLL_INTERVAL_SECONDS=5
+DNS_STACK_WAIT_INTERVAL_SECONDS=2
 
 load_config_if_available() {
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -52,6 +53,31 @@ query_warp_dns_proxy() {
         | /usr/bin/grep -Eq '(^|[[:space:]])([0-9]{1,3}\.){3}[0-9]{1,3}$'
 }
 
+query_dnsmasq() {
+    /usr/bin/dig @"$DNSMASQ_ADDRESS" example.com A +short +time=2 +tries=1 2>/dev/null \
+        | /usr/bin/grep -Eq '(^|[[:space:]])([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+query_split_dns_path() {
+    if [[ -z "$WARP_DNS_HEALTHCHECK_DOMAIN" ]]; then
+        return 0
+    fi
+
+    /usr/bin/dig @"$DNSMASQ_ADDRESS" "$WARP_DNS_HEALTHCHECK_DOMAIN" A +short +time=2 +tries=1 2>/dev/null \
+        | /usr/bin/grep -Eq '(^|[[:space:]])([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+dns_stack_ready() {
+    query_dnsmasq && query_split_dns_path
+}
+
+wait_for_dns_stack() {
+    until dns_stack_ready; do
+        logger -t warp-split "Waiting for dnsmasq, retry proxy, and WARP DNS before applying override"
+        sleep "$DNS_STACK_WAIT_INTERVAL_SECONDS"
+    done
+}
+
 recover_warp_dns_proxy() {
     logger -t warp-split "Restarting WARP daemon after repeated DNS health check failures for $WARP_DNS_HEALTHCHECK_DOMAIN"
 
@@ -62,6 +88,7 @@ recover_warp_dns_proxy() {
     fi
 
     /usr/bin/dscacheutil -flushcache 2>/dev/null || true
+    wait_for_dns_stack
     apply_override
 }
 
@@ -105,7 +132,8 @@ healthcheck_failure_count=0
 last_healthcheck_time=0
 last_recovery_time=0
 
-# Apply immediately on start
+# Apply once the local forwarding path is ready on start
+wait_for_dns_stack
 apply_override
 logger -t warp-split "Applied DNS override on start"
 
@@ -114,6 +142,7 @@ while true; do
     sleep "$OVERRIDE_POLL_INTERVAL_SECONDS"
 
     if ! check_override; then
+        wait_for_dns_stack
         apply_override
         logger -t warp-split "Re-applied DNS override after change detected"
     fi

@@ -322,6 +322,7 @@ command_teardown() {
 
 command_enable_quiet() {
     launchctl load "$RETRY_PROXY_PLIST" 2>/dev/null || true
+    launchctl kickstart -k "system/$RETRY_PROXY_LABEL" 2>/dev/null || true
     info "Retry-proxy daemon loaded"
 
     brew services start dnsmasq 2>/dev/null || true
@@ -330,6 +331,7 @@ command_enable_quiet() {
     wait_for_dnsmasq
 
     launchctl load "$DAEMON_PLIST" 2>/dev/null || true
+    launchctl kickstart -k "system/$DAEMON_LABEL" 2>/dev/null || true
     info "DNS override daemon loaded"
 
     dscacheutil -flushcache 2>/dev/null || true
