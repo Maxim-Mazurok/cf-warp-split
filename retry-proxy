@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-retry-proxy — UDP DNS proxy that retries WARP's DNS proxy on SERVFAIL.
+retry-proxy — UDP DNS proxy for resilient WARP resolution.
 
 WARP's local DNS proxies (127.0.2.2 / 127.0.2.3) intermittently return
 SERVFAIL for queries that resolve fine on retry. macOS mDNSResponder caches
@@ -8,10 +8,10 @@ the SERVFAIL as a hard negative for several seconds, so subsequent
 getaddrinfo() calls (ping, curl, browsers) fail with "Unknown host" until
 the cache expires.
 
-This proxy sits between dnsmasq and WARP's DNS proxies. For every incoming
-query it forwards to the WARP proxies and, on SERVFAIL, retries the
-alternate proxy (and again the first) up to MAX_ATTEMPTS times. Any
-non-SERVFAIL response is returned immediately.
+This proxy sits between dnsmasq and WARP's DNS proxies. Its WARP-only listener
+retries SERVFAIL responses without changing existing internal-domain behavior.
+Its WARP-first listener also falls back to configured public resolvers when
+WARP returns an error, NXDOMAIN, or an empty answer.
 
 Listens on UDP only — TCP is not used by dnsmasq's forwarder for these
 queries.
@@ -19,23 +19,27 @@ queries.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import logging.handlers
 import socket
 import socketserver
 import struct
 import sys
+import threading
 import time
+from typing import cast
 
 LISTEN_HOST = "127.0.0.1"
-LISTEN_PORT = 5354
+WARP_ONLY_LISTEN_PORT = 5354
+WARP_FIRST_LISTEN_PORT = 5355
 
-UPSTREAMS: tuple[tuple[str, int], ...] = (
+WARP_UPSTREAMS: tuple[tuple[str, int], ...] = (
     ("127.0.2.2", 53),
     ("127.0.2.3", 53),
 )
 
-MAX_ATTEMPTS = 4
+MAXIMUM_WARP_ATTEMPTS = 4
 UPSTREAM_TIMEOUT_SECONDS = 0.7
 RETRY_BACKOFF_SECONDS = 0.025
 
@@ -51,6 +55,16 @@ def extract_response_code(packet: bytes) -> int:
         return -1
     flags = struct.unpack("!H", packet[2:4])[0]
     return flags & 0x0F
+
+
+def extract_answer_count(packet: bytes) -> int:
+    if len(packet) < 8:
+        return -1
+    return struct.unpack("!H", packet[6:8])[0]
+
+
+def has_usable_answer(packet: bytes) -> bool:
+    return extract_response_code(packet) == DNS_RESPONSE_CODE_NOERROR and extract_answer_count(packet) > 0
 
 
 def extract_question_end_offset(packet: bytes) -> int:
@@ -139,46 +153,83 @@ def forward_once(upstream: tuple[str, int], packet: bytes, timeout: float) -> by
         return response
 
 
-def resolve(packet: bytes) -> bytes | None:
-    last_response: bytes | None = None
-    for attempt_index in range(MAX_ATTEMPTS):
-        upstream = UPSTREAMS[attempt_index % len(UPSTREAMS)]
+def resolve_with_public_dns(
+    packet: bytes,
+    public_upstreams: tuple[tuple[str, int], ...],
+    warp_response: bytes | None,
+) -> bytes | None:
+    last_response = warp_response
+    for public_upstream in public_upstreams:
         try:
-            response = forward_once(upstream, packet, UPSTREAM_TIMEOUT_SECONDS)
+            response = forward_once(public_upstream, packet, UPSTREAM_TIMEOUT_SECONDS)
         except (socket.timeout, OSError) as error:
             logger.warning(
-                "upstream %s:%d error on attempt %d for %s: %s",
-                upstream[0], upstream[1], attempt_index + 1, extract_question(packet), error,
+                "public upstream %s:%d error for %s: %s",
+                public_upstream[0], public_upstream[1], extract_question(packet), error,
             )
             continue
 
         last_response = response
         if extract_response_code(response) != DNS_RESPONSE_CODE_SERVFAIL:
+            return response
+
+        logger.warning(
+            "SERVFAIL from public upstream %s:%d for %s",
+            public_upstream[0], public_upstream[1], extract_question(packet),
+        )
+
+    logger.error("public fallback exhausted for %s", extract_question(packet))
+    return build_exhausted_attempts_response(packet, last_response)
+
+
+def resolve(packet: bytes, public_upstreams: tuple[tuple[str, int], ...] = ()) -> bytes | None:
+    last_warp_response: bytes | None = None
+    for attempt_index in range(MAXIMUM_WARP_ATTEMPTS):
+        warp_upstream = WARP_UPSTREAMS[attempt_index % len(WARP_UPSTREAMS)]
+        try:
+            response = forward_once(warp_upstream, packet, UPSTREAM_TIMEOUT_SECONDS)
+        except (socket.timeout, OSError) as error:
+            logger.warning(
+                "upstream %s:%d error on attempt %d for %s: %s",
+                warp_upstream[0], warp_upstream[1], attempt_index + 1, extract_question(packet), error,
+            )
+            continue
+
+        last_warp_response = response
+        if extract_response_code(response) != DNS_RESPONSE_CODE_SERVFAIL:
+            if public_upstreams and not has_usable_answer(response):
+                logger.info("WARP had no usable answer for %s; trying public DNS", extract_question(packet))
+                return resolve_with_public_dns(packet, public_upstreams, response)
             if attempt_index > 0:
                 logger.info(
                     "recovered after %d attempts for %s via %s:%d",
-                    attempt_index + 1, extract_question(packet), upstream[0], upstream[1],
+                    attempt_index + 1, extract_question(packet), warp_upstream[0], warp_upstream[1],
                 )
             return response
 
         logger.warning(
             "SERVFAIL on attempt %d for %s via %s:%d",
-            attempt_index + 1, extract_question(packet), upstream[0], upstream[1],
+            attempt_index + 1, extract_question(packet), warp_upstream[0], warp_upstream[1],
         )
         time.sleep(RETRY_BACKOFF_SECONDS)
 
+    if public_upstreams:
+        logger.info("WARP attempts exhausted for %s; trying public DNS", extract_question(packet))
+        return resolve_with_public_dns(packet, public_upstreams, last_warp_response)
+
     logger.error(
         "exhausted %d attempts for %s; returning synthetic response when needed",
-        MAX_ATTEMPTS, extract_question(packet),
+        MAXIMUM_WARP_ATTEMPTS, extract_question(packet),
     )
-    return build_exhausted_attempts_response(packet, last_response)
+    return build_exhausted_attempts_response(packet, last_warp_response)
 
 
 class Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         packet, server_socket = self.request
+        dns_server = cast("ThreadedUDPServer", self.server)
         try:
-            response = resolve(packet)
+            response = resolve(packet, dns_server.public_upstreams)
         except Exception as error:
             logger.exception("unhandled error resolving query: %s", error)
             return
@@ -193,6 +244,14 @@ class ThreadedUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        public_upstreams: tuple[tuple[str, int], ...],
+    ) -> None:
+        self.public_upstreams = public_upstreams
+        super().__init__(server_address, Handler)
+
 
 def configure_logging() -> None:
     logger.setLevel(logging.INFO)
@@ -205,16 +264,33 @@ def configure_logging() -> None:
     logger.addHandler(stream_handler)
 
 
+def parse_public_upstreams() -> tuple[tuple[str, int], ...]:
+    argument_parser = argparse.ArgumentParser()
+    argument_parser.add_argument("--public-upstream", action="append", required=True)
+    arguments = argument_parser.parse_args()
+    return tuple((public_upstream, 53) for public_upstream in arguments.public_upstream)
+
+
 def main() -> None:
     configure_logging()
-    server = ThreadedUDPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    logger.info("listening on %s:%d, upstreams=%s", LISTEN_HOST, LISTEN_PORT, list(UPSTREAMS))
+    public_upstreams = parse_public_upstreams()
+    warp_only_server = ThreadedUDPServer((LISTEN_HOST, WARP_ONLY_LISTEN_PORT), ())
+    warp_first_server = ThreadedUDPServer((LISTEN_HOST, WARP_FIRST_LISTEN_PORT), public_upstreams)
+    warp_only_thread = threading.Thread(target=warp_only_server.serve_forever, name="warp-only-dns", daemon=True)
+    warp_only_thread.start()
+    logger.info(
+        "listening on %s:%d for WARP-only DNS and %s:%d for WARP-first DNS; public upstreams=%s",
+        LISTEN_HOST, WARP_ONLY_LISTEN_PORT, LISTEN_HOST, WARP_FIRST_LISTEN_PORT, list(public_upstreams),
+    )
     try:
-        server.serve_forever()
+        warp_first_server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
+        warp_first_server.server_close()
+        warp_only_server.shutdown()
+        warp_only_server.server_close()
+        warp_only_thread.join()
 
 
 if __name__ == "__main__":

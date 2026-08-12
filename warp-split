@@ -32,6 +32,7 @@ WARP_DNS_PROXY_ALT="127.0.2.3"
 DNSMASQ_LISTEN="127.0.0.1"
 RETRY_PROXY_LISTEN="127.0.0.1"
 RETRY_PROXY_PORT="5354"
+WARP_FIRST_PROXY_PORT="5355"
 
 # Detect Homebrew prefix (Apple Silicon vs Intel)
 if [[ -d /opt/homebrew ]]; then
@@ -74,12 +75,20 @@ load_config() {
     fi
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
+    set_config_defaults
 }
 
 load_config_if_present() {
     if [[ -f "$CONFIG_FILE" ]]; then
         # shellcheck source=/dev/null
         source "$CONFIG_FILE"
+        set_config_defaults
+    fi
+}
+
+set_config_defaults() {
+    if ! declare -p WARP_FIRST_DOMAINS &>/dev/null; then
+        WARP_FIRST_DOMAINS=()
     fi
 }
 
@@ -120,6 +129,13 @@ DNSMASQ_EOF
 
     for domain in "${INTERNAL_DOMAINS[@]}"; do
         echo "server=/${domain}/${RETRY_PROXY_LISTEN}#${RETRY_PROXY_PORT}" >> "$output_file"
+    done
+
+    echo "" >> "$output_file"
+    echo "# === WARP-first domains → WARP DNS, then public DNS on no answer ===" >> "$output_file"
+
+    for domain in "${WARP_FIRST_DOMAINS[@]}"; do
+        echo "server=/${domain}/${RETRY_PROXY_LISTEN}#${WARP_FIRST_PROXY_PORT}" >> "$output_file"
     done
 
     echo "" >> "$output_file"
@@ -197,6 +213,16 @@ generate_retry_proxy_plist() {
         <string>/usr/bin/env</string>
         <string>python3</string>
         <string>${RETRY_PROXY_SCRIPT}</string>
+PLIST_EOF
+
+    for public_dns_server in "${PUBLIC_DNS_SERVERS[@]}"; do
+        cat >> "$RETRY_PROXY_PLIST" <<PLIST_EOF
+        <string>--public-upstream</string>
+        <string>${public_dns_server}</string>
+PLIST_EOF
+    done
+
+    cat >> "$RETRY_PROXY_PLIST" <<PLIST_EOF
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -267,7 +293,7 @@ remove_hosts_entry() {
 command_setup() {
     step "Loading config"
     load_config
-    info "Loaded ${#INTERNAL_DOMAINS[@]} internal domains, ${#PUBLIC_DNS_SERVERS[@]} public DNS servers"
+    info "Loaded ${#INTERNAL_DOMAINS[@]} internal domains, ${#WARP_FIRST_DOMAINS[@]} WARP-first domains, ${#PUBLIC_DNS_SERVERS[@]} public DNS servers"
 
     step "Installing dnsmasq"
     if command -v dnsmasq &>/dev/null; then
@@ -445,6 +471,14 @@ command_status() {
 command_generate() {
     step "Regenerating dnsmasq config"
     generate_dnsmasq_config
+
+    step "Regenerating retry-proxy LaunchDaemon"
+    generate_retry_proxy_plist
+    launchctl unload "$RETRY_PROXY_PLIST" 2>/dev/null || true
+    launchctl load "$RETRY_PROXY_PLIST"
+    launchctl kickstart -k "system/$RETRY_PROXY_LABEL" 2>/dev/null || true
+    info "Retry-proxy restarted with current public DNS servers"
+
     step "Restarting dnsmasq"
     brew services restart dnsmasq 2>/dev/null
     info "dnsmasq restarted with new config"

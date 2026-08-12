@@ -13,6 +13,13 @@ INTERNAL_DOMAINS=(
     "yourorg.cloudflareaccess.com"
 )
 
+# Public domain suffixes that have additional or different records in WARP DNS.
+# Queries under these suffixes try WARP first, then fall back to public DNS when
+# WARP returns NXDOMAIN, an empty answer, SERVFAIL, or no response.
+WARP_FIRST_DOMAINS=(
+    # "hybrid.example.net"
+)
+
 # Public DNS servers used for everything NOT in INTERNAL_DOMAINS.
 # These receive your external queries directly, bypassing Cloudflare Gateway.
 PUBLIC_DNS_SERVERS=(

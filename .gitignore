@@ -7,6 +7,10 @@ config
 # macOS
 .DS_Store
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Editor
 *.swp
 *.swo

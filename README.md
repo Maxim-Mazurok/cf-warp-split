@@ -1,6 +1,6 @@
 # warp-split
 
-Split DNS for Cloudflare WARP on macOS. Keep WARP connected for internal resources while routing all other DNS queries directly to public resolvers, bypassing Cloudflare Gateway.
+Split DNS for Cloudflare WARP on macOS. Keep WARP connected for internal resources while routing other DNS queries directly to public resolvers, bypassing Cloudflare Gateway.
 
 ## Why
 
@@ -23,13 +23,16 @@ WARP stays connected, your organization's internal resources keep working, and y
         dnsmasq              ← 127.0.0.1:53
         ╱      ╲
        ╱        ╲
-Internal      External
+WARP-routed    External
 domains       domains
    │              │
    ▼              ▼
-WARP proxy     1.1.1.1
-127.0.2.2      8.8.8.8
+retry proxy    1.1.1.1
+127.0.0.1      8.8.8.8
    │          (direct)
+   ▼
+WARP proxy
+127.0.2.2
    │
    ▼
 Cloudflare
@@ -39,7 +42,7 @@ Cloudflare
 
 1. **dnsmasq** listens on `127.0.0.1:53`. WARP's proxy lives on `127.0.2.2:53` — no port conflict.
 2. A **SupplementalMatchDomains** entry in the macOS dynamic store tells `mDNSResponder` to send all queries to dnsmasq first (order 103800), before WARP's resolver (order 200000).
-3. dnsmasq **forwards** queries for your internal domains to WARP's DNS proxy, and everything else to public DNS.
+3. dnsmasq **forwards** internal domains to WARP, optional WARP-first domains to WARP with public fallback, and everything else directly to public DNS.
 4. A small **LaunchDaemon** waits for the local DNS path to answer, then re-applies the override every 5 seconds in case macOS clears it (sleep/wake, network changes, WARP reconnects). If configured, it also checks WARP's DNS proxy and restarts WARP after repeated proxy failures.
 5. An `/etc/hosts` entry for `connectivity-check.warp-svc` keeps WARP's internal health check working — it uses `getaddrinfo()` which can't resolve this synthetic hostname through DNS, only through `/etc/hosts`.
 
@@ -101,6 +104,20 @@ INTERNAL_DOMAINS=(
 
 These are forwarded to WARP's DNS proxy (`127.0.2.2`) for corporate resolution. Subdomains are matched automatically — `example.com` covers `anything.example.com`.
 
+### WARP-first domains
+
+Some organizations publish a domain publicly but add or override records in their internal DNS. Put those shared suffixes in `WARP_FIRST_DOMAINS`:
+
+```bash
+WARP_FIRST_DOMAINS=(
+   "hybrid.example.net"
+)
+```
+
+Queries under these suffixes try WARP first. If WARP returns NXDOMAIN, an empty answer, SERVFAIL after retries, or does not respond, the proxy tries each configured public resolver. This keeps truly internal domains WARP-only while allowing public records under a shared suffix to resolve.
+
+Only add suffixes that need this behavior: queries matching them are visible to the organization's WARP DNS. All other external queries continue to bypass WARP.
+
 ### Public DNS
 
 ```bash
@@ -135,12 +152,12 @@ WARP_DNS_HEALTHCHECK_RECOVERY_COOLDOWN_SECONDS=$((5 * 60))
 
 The override daemon waits for dnsmasq and this hostname to resolve through the split path before it points macOS at dnsmasq. It also queries WARP's local DNS proxy directly. After repeated failures it restarts the WARP daemon, flushes the macOS DNS cache, waits for the split path to recover, and reapplies the resolver override.
 
-## Updating internal domains
+## Updating routing domains
 
 1. Edit your `config` file
 2. Run `sudo ./warp-split generate`
 
-This regenerates the dnsmasq config and restarts dnsmasq.
+This regenerates the dnsmasq and retry-proxy configuration, then restarts both services.
 
 ## Troubleshooting
 
@@ -183,7 +200,7 @@ dig your.internal.domain @127.0.2.2
 
 If dnsmasq logs `reply error is SERVFAIL` for the A query, the request reached the split resolver and WARP's DNS proxy returned an error. Configure `WARP_DNS_HEALTHCHECK_DOMAIN` so the daemon can detect repeated failures and restart WARP automatically.
 
-If retry-proxy logs exhausted attempts for an internal `AAAA` query, it returns an empty IPv6 answer instead of dropping the request. Internal WTG hosts observed so far only return A records, and dropping the DNS packet makes macOS wait on resolver timeouts even when the A record is already available.
+If retry-proxy logs exhausted attempts for an internal `AAAA` query, it returns an empty IPv6 answer instead of dropping the request. Some internal hosts only return A records, and dropping the DNS packet makes macOS wait on resolver timeouts even when the A record is already available.
 
 ### Verifying the split
 

@@ -8,6 +8,8 @@ Thanks for your interest in improving warp-split.
 warp-split
 ├── warp-split            Main CLI script (bash)
 ├── apply-override        Daemon script — polls and re-applies the DNS override
+├── retry-proxy           DNS proxy — retries WARP and provides selective public fallback
+├── test_retry_proxy.py   Unit tests for retry and fallback behavior
 ├── config.example        Example configuration (tracked in git)
 ├── config                User's actual config (gitignored)
 ├── README.md             User-facing documentation
@@ -15,10 +17,11 @@ warp-split
 └── LICENSE               MIT
 ```
 
-At runtime, `warp-split setup` generates two additional artifacts:
+At runtime, `warp-split setup` generates three additional artifacts:
 
 - `/opt/homebrew/etc/dnsmasq.d/split-dns.conf` — dnsmasq configuration, generated from the user's `config` file
 - `/Library/LaunchDaemons/com.local.split-dns.plist` — LaunchDaemon that runs `apply-override` at boot
+- `/Library/LaunchDaemons/com.local.split-dns-retry-proxy.plist` — LaunchDaemon that runs `retry-proxy` with the configured public resolvers
 
 ## Architecture
 
@@ -27,8 +30,11 @@ The solution has three moving parts:
 ### 1. dnsmasq (DNS forwarder)
 
 Installed via Homebrew. Listens on `127.0.0.1:53` and conditionally forwards:
-- Configured internal domains → `127.0.2.2` and `127.0.2.3` (WARP's DNS proxies)
+- Configured internal domains → `127.0.0.1:5354` (WARP-only retry proxy)
+- Configured WARP-first domains → `127.0.0.1:5355` (WARP with public fallback)
 - Everything else → public DNS servers
+
+The retry proxy sends both routed classes to WARP's local DNS proxies at `127.0.2.2` and `127.0.2.3`. The WARP-first listener uses the public resolvers only when WARP has no usable answer.
 
 ### 2. SupplementalMatchDomains override
 
@@ -86,7 +92,7 @@ Since this modifies system-level DNS, testing requires care:
 ## Development guidelines
 
 - **No PII or organization-specific data** in tracked files. All org-specific config goes in `config` (gitignored).
-- **Bash only** — no Python/Ruby/Node dependencies. The scripts should work on a fresh macOS with just Homebrew.
+- Keep runtime dependencies minimal. `retry-proxy` uses only the Python standard library.
 - `warp-split` uses `set -euo pipefail` — fail fast on errors.
 - Test on both Apple Silicon (`/opt/homebrew`) and Intel (`/usr/local`) Homebrew paths if possible.
 - The `apply-override` daemon must stay lean — it runs continuously as root.
